@@ -1,5 +1,7 @@
 @Library('shared-library') _
 
+def imagesToScan = []
+
 pipeline {
     agent {
         kubernetes {
@@ -13,8 +15,8 @@ spec:
   serviceAccountName: jenkins-agent
   nodeSelector:
     jenkins-agent: true
-spec:
   containers:
+
   - name: crane
     image: gcr.io/go-containerregistry/crane:debug
     command: ["cat"]
@@ -63,6 +65,7 @@ spec:
     - name: harbor-ca
       mountPath: /etc/ssl/certs/additional-ca-cert-bundle.crt
       subPath: additional-ca-cert-bundle.crt
+      
   volumes:
   - name: docker-config
     secret:      
@@ -80,47 +83,50 @@ spec:
         }
     }
     environment {
-        REGISTRY = "harbor.anyman.homelab"
         CA_CERT = "/etc/ssl/certs/additional-ca-cert-bundle.crt"
     }
     stages {
-        stage('Perform fresh vulnerability scan for HuutoApp images') {
+        stage('Load target image list') {
+            steps {
+                script {
+                    def config = readYaml file: 'images-to-scan.yaml'
+                    imagesToScan = config.images
+                }
+            }
+        }
+        stage('Perform fresh vulnerability scan for target images') {
             steps {
                 container('crane') {
                     script {
-                        withEnv([
-                            "REGISTRY=${registry}"
-                        ]) {
-                            sh '''
-                                HUUTOAPI_IMAGE_DIGEST=$(crane digest harbor.anyman.homelab/huutoapp/huutoapi:latest)
-                                HUUTOWORKER_IMAGE_DIGEST=$(crane digest harbor.anyman.homelab/huutoapp/huutoworker:latest)
-                                echo ${HUUTOAPI_IMAGE_DIGEST} > /home/jenkins/agent/huutoapi_digest.txt
-                                echo ${HUUTOWORKER_IMAGE_DIGEST} > /home/jenkins/agent/huutoworker_digest.txt
-                            '''
-                        }
+                        imagesToScan.each { image ->
+                            def safeImage = image.replaceAll('/', '_')
+                            echo "Getting image digest for ${image}"
+                            sh """
+                                echo ${image}
+                                DIGEST=\$(crane digest ${image}:latest)
+                                echo "\$DIGEST" > /home/jenkins/agent/${safeImage}_digest.txt
+                            """
+                        } 
                     }                    
                 }
                 container('trivy') {
                     script {
-                        withEnv([
-                            "REGISTRY=${registry}"
-                        ]) {
-                            sh '''
-                                HUUTOAPI_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoapi_digest.txt)
-                                HUUTOWORKER_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoworker_digest.txt)
-                                echo ${HUUTOAPI_IMAGE_DIGEST}
-                                echo ${HUUTOWORKER_IMAGE_DIGEST}
+                        imagesToScan.each { image ->
+                            def safeImage = image.replaceAll('/', '_')
+                            sh """
+                                echo ${image}
+                                echo ${safeImage}
+                                DIGEST=\$(cat /home/jenkins/agent/${safeImage}_digest.txt)
+                                echo \$DIGEST
                                 trivy image --format cosign-vuln \
-                                    --output /home/jenkins/agent/huutoapi_vuln.json \
-                                    "${REGISTRY}/huutoapp/huutoapi@${HUUTOAPI_IMAGE_DIGEST}"
-                                trivy image --format cosign-vuln \
-                                    --output /home/jenkins/agent/huutoworker_vuln.json \
-                                    "${REGISTRY}/huutoapp/huutoworker@${HUUTOWORKER_IMAGE_DIGEST}"
-                            '''
+                                    --output /home/jenkins/agent/${safeImage}_vuln.json \
+                                    "${image}@\${DIGEST}"                                    
+                            """
                         }
+                        sh 'ls -ltr /home/jenkins/agent'
                     }
                 }
-                 withVault(vaultSecrets: [
+                withVault(vaultSecrets: [
                     [
                         path: 'harbor',
                         engineVersion: 2,
@@ -133,26 +139,27 @@ spec:
                     container('bash') {
                         script {
                             withEnv([
-                                "REGISTRY=${registry}",
                                 "CA_CERT=${ca_cert}"
                             ]) {
                                 def scriptContent = libraryResource 'scripts/delete_vuln_attestation.sh'
                                 writeFile file: 'delete_vuln_attestation.sh', text: scriptContent
-                                sh '''
-                                    HUUTOAPI_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoapi_digest.txt)
-                                    HUUTOWORKER_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoworker_digest.txt)
-                                    chmod +x delete_vuln_attestation.sh
-                                    ./delete_vuln_attestation.sh \
-                                        huutoapp \
-                                        huutoapi \
-                                        ${HUUTOAPI_IMAGE_DIGEST} \
-                                        ${CA_CERT}
-                                    ./delete_vuln_attestation.sh \
-                                        huutoapp \
-                                        huutoworker \
-                                        ${HUUTOWORKER_IMAGE_DIGEST} \
-                                        ${CA_CERT}
-                                '''
+                                sh 'chmod +x delete_vuln_attestation.sh'
+                                imagesToScan.each { image ->
+                                    def safeImage = image.replaceAll('/', '_')
+                                    def parts = image.split('/')
+                                    def registry = parts[0]
+                                    def project  = parts[1]
+                                    def repo     = parts[2]
+                                    sh """
+                                        DIGEST=\$(cat /home/jenkins/agent/${safeImage}_digest.txt)
+                                        ./delete_vuln_attestation.sh \
+                                            ${registry} \
+                                            ${project} \
+                                            ${repo} \
+                                            \${DIGEST} \
+                                            \${CA_CERT}
+                                    """
+                                }
                             }
                         }
                     }
@@ -169,32 +176,29 @@ spec:
                 ]) {
                     container('cosign') {
                         withEnv([
-                            "DOCKER_CONFIG=/docker-config",
-                            "REGISTRY=${registry}"
+                            "DOCKER_CONFIG=/docker-config"
                         ]) {
-
-                            sh '''
-                                HUUTOAPI_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoapi_digest.txt)
-                                HUUTOWORKER_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoworker_digest.txt)                                
-
-                                set +x 
-                                echo "${COSIGN_KEY_FILE}" > /tmp/cosign.key
-                                set -x
-
-                                cosign version
-                                echo "Attest vulnerability scans"
-                                cosign attest --key /tmp/cosign.key \
-                                    --type vuln \
-                                    --predicate /home/jenkins/agent/huutoapi_vuln.json \
-                                   "${REGISTRY}/huutoapp/huutoapi@${HUUTOAPI_IMAGE_DIGEST}"
-
-                                cosign attest --key /tmp/cosign.key \
-                                    --type vuln \
-                                    --predicate /home/jenkins/agent/huutoworker_vuln.json \
-                                   "${REGISTRY}/huutoapp/huutoworker@${HUUTOWORKER_IMAGE_DIGEST}"
+                            script {
+                                imagesToScan.each { image ->
+                                    def safeImage = image.replaceAll('/', '_')
+                                    sh """
+                                        DIGEST=\$(cat /home/jenkins/agent/${safeImage}_digest.txt)
+        
+                                        set +x 
+                                        echo "\${COSIGN_KEY_FILE}" > /tmp/cosign.key
+                                        set -x
             
-                                rm -f /tmp/cosign.key
-                            '''
+                                        cosign version
+                                        echo "Attest vulnerability scans"
+                                        cosign attest --key /tmp/cosign.key \
+                                            --type vuln \
+                                            --predicate /home/jenkins/agent/${safeImage}_vuln.json \
+                                           "${image}@\${DIGEST}"
+        
+                                        rm -f /tmp/cosign.key
+                                    """
+                                }
+                            }
                         }
                     }
                 }
