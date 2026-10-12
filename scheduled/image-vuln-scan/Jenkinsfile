@@ -1,0 +1,204 @@
+@Library('shared-library') _
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  name: image-vuln-scan
+  namespace: jenkins-agents
+spec:   
+  serviceAccountName: jenkins-agent
+  nodeSelector:
+    jenkins-agent: true
+spec:
+  containers:
+  - name: crane
+    image: gcr.io/go-containerregistry/crane:debug
+    command: ["cat"]
+    tty: true
+    workingDir: /home/jenkins/agent
+    volumeMounts:
+    - name: docker-config
+      mountPath: /docker-config
+    - name: harbor-ca
+      mountPath: /etc/ssl/certs/additional-ca-cert-bundle.crt
+      subPath: additional-ca-cert-bundle.crt
+
+  - name: trivy
+    image: aquasec/trivy:latest
+    command: ["cat"]
+    tty: true
+    workingDir: /home/jenkins/agent
+    volumeMounts:
+    - name: docker-config
+      mountPath: /docker-config
+    - name: harbor-ca
+      mountPath: /etc/ssl/certs/additional-ca-cert-bundle.crt
+      subPath: additional-ca-cert-bundle.crt
+
+  - name: bash
+    image: cfmanteiga/alpine-bash-curl-jq:latest
+    command: ["cat"]
+    tty: true
+    workingDir: /home/jenkins/agent
+    volumeMounts:
+    - name: harbor-ca
+      mountPath: /etc/ssl/certs/additional-ca-cert-bundle.crt
+      subPath: additional-ca-cert-bundle.crt
+      
+  - name: cosign
+    #image: cgr.dev/chainguard/cosign:latest-dev
+    image: ghcr.io/sigstore/cosign/cosign:v3.1.3-dev
+    command:
+    - "cat"
+    tty: true
+    securityContext:
+      runAsUser: 0
+    volumeMounts:
+    - name: docker-config
+      mountPath: /docker-config
+    - name: harbor-ca
+      mountPath: /etc/ssl/certs/additional-ca-cert-bundle.crt
+      subPath: additional-ca-cert-bundle.crt
+  volumes:
+  - name: docker-config
+    secret:      
+      secretName: harbor-credentials   
+      items:
+      - key: .dockerconfigjson
+        path: config.json
+  - name: harbor-ca
+    secret:
+      secretName: harbor-ca-cert   
+      items:
+      - key: ca.crt
+        path: additional-ca-cert-bundle.crt
+'''
+        }
+    }
+    environment {
+        REGISTRY = "harbor.anyman.homelab"
+        CA_CERT = "/etc/ssl/certs/additional-ca-cert-bundle.crt"
+    }
+    stages {
+        stage('Perform fresh vulnerability scan for HuutoApp images') {
+            steps {
+                container('crane') {
+                    script {
+                        withEnv([
+                            "REGISTRY=${registry}"
+                        ]) {
+                            sh '''
+                                HUUTOAPI_IMAGE_DIGEST=$(crane digest harbor.anyman.homelab/huutoapp/huutoapi:latest)
+                                HUUTOWORKER_IMAGE_DIGEST=$(crane digest harbor.anyman.homelab/huutoapp/huutoworker:latest)
+                                echo ${HUUTOAPI_IMAGE_DIGEST} > /home/jenkins/agent/huutoapi_digest.txt
+                                echo ${HUUTOWORKER_IMAGE_DIGEST} > /home/jenkins/agent/huutoworker_digest.txt
+                            '''
+                        }
+                    }                    
+                }
+                container('trivy') {
+                    script {
+                        withEnv([
+                            "REGISTRY=${registry}"
+                        ]) {
+                            sh '''
+                                HUUTOAPI_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoapi_digest.txt)
+                                HUUTOWORKER_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoworker_digest.txt)
+                                echo ${HUUTOAPI_IMAGE_DIGEST}
+                                echo ${HUUTOWORKER_IMAGE_DIGEST}
+                                trivy image --format cosign-vuln \
+                                    --output /home/jenkins/agent/huutoapi_vuln.json \
+                                    "${REGISTRY}/huutoapp/huutoapi@${HUUTOAPI_IMAGE_DIGEST}"
+                                trivy image --format cosign-vuln \
+                                    --output /home/jenkins/agent/huutoworker_vuln.json \
+                                    "${REGISTRY}/huutoapp/huutoworker@${HUUTOWORKER_IMAGE_DIGEST}"
+                            '''
+                        }
+                    }
+                }
+                 withVault(vaultSecrets: [
+                    [
+                        path: 'harbor',
+                        engineVersion: 2,
+                        secretValues: [
+                            [vaultKey: 'admin-username', envVar: 'HARBOR_USERNAME'],
+                            [vaultKey: 'admin-password', envVar: 'HARBOR_PASSWORD']
+                        ]
+                    ]
+                ]) {
+                    container('bash') {
+                        script {
+                            withEnv([
+                                "REGISTRY=${registry}",
+                                "CA_CERT=${ca_cert}"
+                            ]) {
+                                def scriptContent = libraryResource 'scripts/delete_vuln_attestation.sh'
+                                writeFile file: 'delete_vuln_attestation.sh', text: scriptContent
+                                sh '''
+                                    HUUTOAPI_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoapi_digest.txt)
+                                    HUUTOWORKER_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoworker_digest.txt)
+                                    chmod +x delete_vuln_attestation.sh
+                                    ./delete_vuln_attestation.sh \
+                                        huutoapp \
+                                        huutoapi \
+                                        ${HUUTOAPI_IMAGE_DIGEST} \
+                                        ${CA_CERT}
+                                    ./delete_vuln_attestation.sh \
+                                        huutoapp \
+                                        huutoworker \
+                                        ${HUUTOWORKER_IMAGE_DIGEST} \
+                                        ${CA_CERT}
+                                '''
+                            }
+                        }
+                    }
+                }
+                withVault(vaultSecrets: [
+                    [
+                        path: 'cosign',
+                        engineVersion: 2,
+                        secretValues: [
+                            [vaultKey: 'password', envVar: 'COSIGN_PASSWORD'],
+                            [vaultKey: 'private_key', envVar: 'COSIGN_KEY_FILE']
+                        ]
+                    ]
+                ]) {
+                    container('cosign') {
+                        withEnv([
+                            "DOCKER_CONFIG=/docker-config",
+                            "REGISTRY=${registry}"
+                        ]) {
+
+                            sh '''
+                                HUUTOAPI_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoapi_digest.txt)
+                                HUUTOWORKER_IMAGE_DIGEST=$(cat /home/jenkins/agent/huutoworker_digest.txt)                                
+
+                                set +x 
+                                echo "${COSIGN_KEY_FILE}" > /tmp/cosign.key
+                                set -x
+
+                                cosign version
+                                echo "Attest vulnerability scans"
+                                cosign attest --key /tmp/cosign.key \
+                                    --type vuln \
+                                    --predicate /home/jenkins/agent/huutoapi_vuln.json \
+                                   "${REGISTRY}/huutoapp/huutoapi@${HUUTOAPI_IMAGE_DIGEST}"
+
+                                cosign attest --key /tmp/cosign.key \
+                                    --type vuln \
+                                    --predicate /home/jenkins/agent/huutoworker_vuln.json \
+                                   "${REGISTRY}/huutoapp/huutoworker@${HUUTOWORKER_IMAGE_DIGEST}"
+            
+                                rm -f /tmp/cosign.key
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
