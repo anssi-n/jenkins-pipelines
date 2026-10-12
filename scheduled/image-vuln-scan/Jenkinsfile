@@ -89,7 +89,7 @@ spec:
         stage('Load target image list') {
             steps {
                 script {
-                    def config = readYaml file: 'images-to-scan.yaml'
+                    def config = readYaml file: 'scheduled/image-vuln-scan/images-to-scan.yaml'
                     imagesToScan = config.images
                 }
             }
